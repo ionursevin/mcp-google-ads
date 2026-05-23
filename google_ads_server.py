@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('google_ads_server')
 
+from mcp.server.transport_security import TransportSecuritySettings
 mcp = FastMCP(
     "google-ads-server",
     dependencies=[
@@ -27,7 +28,10 @@ mcp = FastMCP(
         "google-auth",
         "requests",
         "python-dotenv"
-    ]
+    ],
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
 )
 
 # Constants and configuration
@@ -1473,10 +1477,6 @@ async def list_resources(
 
 if __name__ == "__main__":
     import os
-    import uvicorn
-    app = mcp.sse_app()
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-    )
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = int(os.environ.get("PORT", 8000))
+    mcp.run(transport="sse")
