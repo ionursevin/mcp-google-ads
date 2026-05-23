@@ -20,6 +20,28 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('google_ads_server')
 
+# Write credentials.json from env vars for Railway/hosted deployment.
+# Writes in the "saved authorized user" format so get_oauth_credentials()
+# loads it directly without triggering the interactive browser flow.
+_creds_path_default = "/tmp/google_ads_credentials.json"
+if not os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH") and os.environ.get("GOOGLE_ADS_CLIENT_ID"):
+    _refresh_token = os.environ.get("GOOGLE_ADS_REFRESH_TOKEN")
+    _client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
+    _client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
+    if _refresh_token and _client_id and _client_secret:
+        _creds_payload = {
+            "token": None,
+            "refresh_token": _refresh_token,
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": _client_id,
+            "client_secret": _client_secret,
+            "scopes": ["https://www.googleapis.com/auth/adwords"],
+        }
+        with open(_creds_path_default, "w") as _f:
+            json.dump(_creds_payload, _f)
+        os.environ["GOOGLE_ADS_CREDENTIALS_PATH"] = _creds_path_default
+        os.environ.setdefault("GOOGLE_ADS_AUTH_TYPE", "oauth")
+
 from mcp.server.transport_security import TransportSecuritySettings
 mcp = FastMCP(
     "google-ads-server",
