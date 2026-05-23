@@ -1475,4 +1475,7 @@ if __name__ == "__main__":
     import os
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = int(os.environ.get("PORT", 8000))
+    # Disable host header validation (Railway proxies the request, so the host won't match)
+    if hasattr(mcp.settings, "allowed_hosts"):
+        mcp.settings.allowed_hosts = ["*"]
     mcp.run(transport="sse")
