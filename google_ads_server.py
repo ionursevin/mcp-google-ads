@@ -45,6 +45,97 @@ if not os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH") and os.environ.get("GOOGLE_
         os.environ.setdefault("GOOGLE_ADS_AUTH_TYPE", "oauth")
 
 from mcp.server.transport_security import TransportSecuritySettings
+
+# ============================================================================
+# GUARDRAILS — hard limits the agent literally cannot exceed.
+# These are enforced in code, not via prompts. Override only by editing here
+# and redeploying. Values can be tuned via env vars; defaults are conservative.
+# ============================================================================
+GUARDRAIL_MAX_DAILY_BUDGET_TOTAL_MICROS = int(os.environ.get(
+    "GUARDRAIL_MAX_DAILY_BUDGET_TOTAL_MICROS",
+    100_000_000  # ₺100/day total across all campaigns (currency-agnostic; the API uses micros)
+))
+GUARDRAIL_MAX_CHANGE_PCT = float(os.environ.get("GUARDRAIL_MAX_CHANGE_PCT", "10.0"))  # ±10% per change
+GUARDRAIL_PROTECTED_CAMPAIGN_IDS = [
+    cid.strip() for cid in os.environ.get("GUARDRAIL_PROTECTED_CAMPAIGN_IDS", "").split(",") if cid.strip()
+]
+GUARDRAIL_DRY_RUN = os.environ.get("GUARDRAIL_DRY_RUN", "false").lower() == "true"
+
+logger.info(
+    f"Guardrails: max_daily_total={GUARDRAIL_MAX_DAILY_BUDGET_TOTAL_MICROS/1_000_000}, "
+    f"max_change_pct=±{GUARDRAIL_MAX_CHANGE_PCT}%, "
+    f"protected_campaigns={GUARDRAIL_PROTECTED_CAMPAIGN_IDS or 'none'}, "
+    f"dry_run={GUARDRAIL_DRY_RUN}"
+)
+
+
+class GuardrailViolation(Exception):
+    """Raised when a write operation would violate a configured guardrail."""
+    pass
+
+
+def _enforce_change_pct(old_value: float, new_value: float, what: str) -> None:
+    """Reject changes larger than GUARDRAIL_MAX_CHANGE_PCT percent."""
+    if old_value <= 0:
+        return  # Can't compute pct from zero; allow but caller should sanity-check
+    pct = abs(new_value - old_value) / old_value * 100.0
+    if pct > GUARDRAIL_MAX_CHANGE_PCT:
+        raise GuardrailViolation(
+            f"Change to {what} would be {pct:.1f}% (from {old_value} to {new_value}); "
+            f"max allowed per single change is ±{GUARDRAIL_MAX_CHANGE_PCT}%. "
+            f"Make smaller incremental changes."
+        )
+
+
+def _enforce_protected(campaign_id: str) -> None:
+    """Reject mutations on campaigns explicitly protected."""
+    if str(campaign_id) in GUARDRAIL_PROTECTED_CAMPAIGN_IDS:
+        raise GuardrailViolation(
+            f"Campaign {campaign_id} is in GUARDRAIL_PROTECTED_CAMPAIGN_IDS and cannot be modified."
+        )
+
+
+def _get_account_total_daily_budget_micros(customer_id: str, creds, headers) -> int:
+    """Sum all enabled campaign daily budgets for the account, in micros."""
+    formatted = format_customer_id(customer_id)
+    url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/googleAds:search"
+    query = """
+        SELECT campaign.id, campaign_budget.amount_micros, campaign.status
+        FROM campaign
+        WHERE campaign.status = 'ENABLED'
+    """
+    response = requests.post(url, headers=headers, json={"query": query})
+    if response.status_code != 200:
+        raise GuardrailViolation(f"Could not verify total budget before write: {response.text}")
+    total = 0
+    for row in response.json().get("results", []):
+        try:
+            total += int(row.get("campaignBudget", {}).get("amountMicros", 0))
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def _enforce_total_budget_cap(customer_id: str, delta_micros: int, creds, headers) -> None:
+    """Reject if applying delta would push account daily total over the cap."""
+    current_total = _get_account_total_daily_budget_micros(customer_id, creds, headers)
+    projected = current_total + delta_micros
+    if projected > GUARDRAIL_MAX_DAILY_BUDGET_TOTAL_MICROS:
+        raise GuardrailViolation(
+            f"This change would push account daily budget total to "
+            f"{projected/1_000_000:.2f} (currency units); the configured cap is "
+            f"{GUARDRAIL_MAX_DAILY_BUDGET_TOTAL_MICROS/1_000_000:.2f}. "
+            f"Current total: {current_total/1_000_000:.2f}, delta: {delta_micros/1_000_000:+.2f}."
+        )
+
+
+def _maybe_dry_run(operation_description: str) -> Optional[str]:
+    """If GUARDRAIL_DRY_RUN is on, short-circuit with a description instead of executing."""
+    if GUARDRAIL_DRY_RUN:
+        return f"[DRY RUN — no changes applied] Would execute: {operation_description}"
+    return None
+# ============================================================================
+
 mcp = FastMCP(
     "google-ads-server",
     dependencies=[
@@ -1498,6 +1589,440 @@ async def list_resources(
     
     # Use your existing run_gaql function to execute this query
     return await run_gaql(customer_id, query)
+
+# ============================================================================
+# WRITE TOOLS — every mutation passes through guardrails defined above.
+# ============================================================================
+
+def _campaign_resource(customer_id: str, campaign_id: str) -> str:
+    return f"customers/{format_customer_id(customer_id)}/campaigns/{campaign_id}"
+
+
+def _campaign_budget_resource(customer_id: str, budget_id: str) -> str:
+    return f"customers/{format_customer_id(customer_id)}/campaignBudgets/{budget_id}"
+
+
+def _fetch_campaign(customer_id: str, campaign_id: str, headers) -> Dict[str, Any]:
+    """Read current state of one campaign (status, name, budget link, bidding)."""
+    formatted = format_customer_id(customer_id)
+    url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/googleAds:search"
+    query = f"""
+        SELECT campaign.id, campaign.name, campaign.status,
+               campaign.campaign_budget, campaign_budget.amount_micros,
+               campaign.bidding_strategy_type,
+               campaign.manual_cpc.enhanced_cpc_enabled,
+               campaign.target_cpa.target_cpa_micros,
+               campaign.target_roas.target_roas
+        FROM campaign
+        WHERE campaign.id = {campaign_id}
+    """
+    response = requests.post(url, headers=headers, json={"query": query})
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not read campaign {campaign_id}: {response.text}")
+    results = response.json().get("results", [])
+    if not results:
+        raise RuntimeError(f"Campaign {campaign_id} not found in customer {customer_id}")
+    return results[0]
+
+
+@mcp.tool()
+async def pause_campaign(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    campaign_id: str = Field(description="Campaign ID to pause"),
+    reason: str = Field(description="Why you're pausing this campaign (logged for audit)")
+) -> str:
+    """
+    Pause a campaign. The campaign stays in the account but stops serving ads.
+
+    Guardrails: protected campaigns cannot be paused. Reason is required for audit trail.
+    """
+    try:
+        _enforce_protected(campaign_id)
+        dry = _maybe_dry_run(f"pause campaign {campaign_id} (reason: {reason})")
+        if dry:
+            return dry
+
+        creds = get_credentials()
+        headers = get_headers(creds)
+        formatted = format_customer_id(customer_id)
+
+        logger.info(f"[WRITE] Pausing campaign {campaign_id} in {formatted}. Reason: {reason}")
+
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/campaigns:mutate"
+        payload = {
+            "operations": [{
+                "updateMask": "status",
+                "update": {
+                    "resourceName": _campaign_resource(customer_id, campaign_id),
+                    "status": "PAUSED"
+                }
+            }]
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            return f"Error pausing campaign: {response.text}"
+        return f"✓ Campaign {campaign_id} paused. Reason: {reason}"
+    except GuardrailViolation as e:
+        return f"✗ Guardrail blocked this change: {e}"
+    except Exception as e:
+        logger.exception("pause_campaign failed")
+        return f"✗ Error: {e}"
+
+
+@mcp.tool()
+async def enable_campaign(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    campaign_id: str = Field(description="Campaign ID to enable"),
+    reason: str = Field(description="Why you're enabling this campaign (logged for audit)")
+) -> str:
+    """
+    Enable a previously paused campaign. The campaign resumes serving ads at its existing budget.
+
+    Guardrails: the campaign's current daily budget must fit under the account-wide
+    daily budget cap. Reason is required for audit trail.
+    """
+    try:
+        _enforce_protected(campaign_id)
+        dry = _maybe_dry_run(f"enable campaign {campaign_id} (reason: {reason})")
+        if dry:
+            return dry
+
+        creds = get_credentials()
+        headers = get_headers(creds)
+        formatted = format_customer_id(customer_id)
+
+        # Verify enabling won't blow the total budget cap
+        campaign = _fetch_campaign(customer_id, campaign_id, headers)
+        budget_micros = int(campaign.get("campaignBudget", {}).get("amountMicros", 0))
+        _enforce_total_budget_cap(customer_id, delta_micros=budget_micros, creds=creds, headers=headers)
+
+        logger.info(f"[WRITE] Enabling campaign {campaign_id} in {formatted}. Reason: {reason}")
+
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/campaigns:mutate"
+        payload = {
+            "operations": [{
+                "updateMask": "status",
+                "update": {
+                    "resourceName": _campaign_resource(customer_id, campaign_id),
+                    "status": "ENABLED"
+                }
+            }]
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            return f"Error enabling campaign: {response.text}"
+        return f"✓ Campaign {campaign_id} enabled at existing budget. Reason: {reason}"
+    except GuardrailViolation as e:
+        return f"✗ Guardrail blocked this change: {e}"
+    except Exception as e:
+        logger.exception("enable_campaign failed")
+        return f"✗ Error: {e}"
+
+
+@mcp.tool()
+async def update_campaign_budget(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    campaign_id: str = Field(description="Campaign ID whose budget you want to change"),
+    new_daily_budget: float = Field(description="New daily budget in account's currency (e.g. 25.50 for ₺25.50)"),
+    reason: str = Field(description="Why you're changing the budget (logged for audit)")
+) -> str:
+    """
+    Change a campaign's daily budget.
+
+    Guardrails:
+    - Change cannot exceed ±10% of current budget (configurable via GUARDRAIL_MAX_CHANGE_PCT)
+    - New account-wide total must not exceed the daily budget cap
+    - Protected campaigns cannot be modified
+    """
+    try:
+        _enforce_protected(campaign_id)
+        dry = _maybe_dry_run(f"set campaign {campaign_id} daily budget to {new_daily_budget} (reason: {reason})")
+        if dry:
+            return dry
+
+        creds = get_credentials()
+        headers = get_headers(creds)
+        formatted = format_customer_id(customer_id)
+
+        campaign = _fetch_campaign(customer_id, campaign_id, headers)
+        budget_resource = campaign.get("campaign", {}).get("campaignBudget")
+        old_micros = int(campaign.get("campaignBudget", {}).get("amountMicros", 0))
+        new_micros = int(round(new_daily_budget * 1_000_000))
+
+        _enforce_change_pct(old_micros, new_micros, f"campaign {campaign_id} daily budget")
+        delta = new_micros - old_micros
+        _enforce_total_budget_cap(customer_id, delta_micros=delta, creds=creds, headers=headers)
+
+        logger.info(
+            f"[WRITE] Updating budget for campaign {campaign_id}: "
+            f"{old_micros/1_000_000:.2f} → {new_daily_budget}. Reason: {reason}"
+        )
+
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/campaignBudgets:mutate"
+        payload = {
+            "operations": [{
+                "updateMask": "amount_micros",
+                "update": {
+                    "resourceName": budget_resource,
+                    "amountMicros": str(new_micros)
+                }
+            }]
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            return f"Error updating budget: {response.text}"
+        return (f"✓ Campaign {campaign_id} budget: {old_micros/1_000_000:.2f} → "
+                f"{new_daily_budget:.2f}. Reason: {reason}")
+    except GuardrailViolation as e:
+        return f"✗ Guardrail blocked this change: {e}"
+    except Exception as e:
+        logger.exception("update_campaign_budget failed")
+        return f"✗ Error: {e}"
+
+
+@mcp.tool()
+async def update_keyword_bid(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    ad_group_id: str = Field(description="Ad group containing the keyword"),
+    criterion_id: str = Field(description="Keyword criterion ID (also called ad_group_criterion.criterion_id)"),
+    new_cpc_bid: float = Field(description="New max CPC bid in account's currency (e.g. 1.25 for ₺1.25)"),
+    reason: str = Field(description="Why you're changing the bid (logged for audit)")
+) -> str:
+    """
+    Update a keyword's max CPC bid.
+
+    Guardrails: change cannot exceed ±10% of current bid (configurable).
+    Note: only applies to keywords in manual-bidding ad groups.
+    """
+    try:
+        dry = _maybe_dry_run(f"set keyword bid in ad group {ad_group_id} criterion {criterion_id} to {new_cpc_bid}")
+        if dry:
+            return dry
+
+        creds = get_credentials()
+        headers = get_headers(creds)
+        formatted = format_customer_id(customer_id)
+
+        # Look up current bid first
+        search_url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/googleAds:search"
+        query = f"""
+            SELECT ad_group_criterion.criterion_id,
+                   ad_group_criterion.cpc_bid_micros,
+                   ad_group.id, campaign.id
+            FROM ad_group_criterion
+            WHERE ad_group.id = {ad_group_id}
+              AND ad_group_criterion.criterion_id = {criterion_id}
+        """
+        resp = requests.post(search_url, headers=headers, json={"query": query})
+        if resp.status_code != 200:
+            return f"Could not read current bid: {resp.text}"
+        rows = resp.json().get("results", [])
+        if not rows:
+            return f"Keyword criterion {criterion_id} not found in ad group {ad_group_id}"
+
+        # Enforce protected check on the parent campaign
+        parent_campaign = rows[0].get("campaign", {}).get("id", "")
+        _enforce_protected(parent_campaign)
+
+        old_micros = int(rows[0].get("adGroupCriterion", {}).get("cpcBidMicros", 0))
+        new_micros = int(round(new_cpc_bid * 1_000_000))
+        _enforce_change_pct(old_micros, new_micros, f"keyword bid (criterion {criterion_id})")
+
+        logger.info(
+            f"[WRITE] Updating bid: ad_group {ad_group_id} / criterion {criterion_id}: "
+            f"{old_micros/1_000_000:.2f} → {new_cpc_bid}. Reason: {reason}"
+        )
+
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/adGroupCriteria:mutate"
+        resource = f"customers/{formatted}/adGroupCriteria/{ad_group_id}~{criterion_id}"
+        payload = {
+            "operations": [{
+                "updateMask": "cpc_bid_micros",
+                "update": {
+                    "resourceName": resource,
+                    "cpcBidMicros": str(new_micros)
+                }
+            }]
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            return f"Error updating bid: {response.text}"
+        return (f"✓ Keyword bid: {old_micros/1_000_000:.2f} → {new_cpc_bid:.2f}. "
+                f"Reason: {reason}")
+    except GuardrailViolation as e:
+        return f"✗ Guardrail blocked this change: {e}"
+    except Exception as e:
+        logger.exception("update_keyword_bid failed")
+        return f"✗ Error: {e}"
+
+
+@mcp.tool()
+async def add_negative_keyword(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    campaign_id: str = Field(description="Campaign to add the negative keyword to"),
+    keyword_text: str = Field(description="The keyword text to exclude (e.g. 'free')"),
+    match_type: str = Field(description="Match type: BROAD, PHRASE, or EXACT", default="EXACT"),
+    reason: str = Field(description="Why you're adding this negative (logged for audit)")
+) -> str:
+    """
+    Add a campaign-level negative keyword. Ads will stop matching searches that include it.
+
+    Guardrails: protected campaigns cannot be modified. Match type defaults to EXACT
+    (the safest choice — won't accidentally block adjacent queries).
+    """
+    try:
+        _enforce_protected(campaign_id)
+        match_type = match_type.upper()
+        if match_type not in ("BROAD", "PHRASE", "EXACT"):
+            return f"✗ match_type must be BROAD, PHRASE, or EXACT (got {match_type})"
+
+        dry = _maybe_dry_run(f"add {match_type} negative keyword '{keyword_text}' to campaign {campaign_id}")
+        if dry:
+            return dry
+
+        creds = get_credentials()
+        headers = get_headers(creds)
+        formatted = format_customer_id(customer_id)
+
+        logger.info(
+            f"[WRITE] Adding negative keyword '{keyword_text}' ({match_type}) "
+            f"to campaign {campaign_id}. Reason: {reason}"
+        )
+
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/campaignCriteria:mutate"
+        payload = {
+            "operations": [{
+                "create": {
+                    "campaign": _campaign_resource(customer_id, campaign_id),
+                    "negative": True,
+                    "keyword": {
+                        "text": keyword_text,
+                        "matchType": match_type
+                    }
+                }
+            }]
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            return f"Error adding negative keyword: {response.text}"
+        return (f"✓ Negative keyword '{keyword_text}' ({match_type}) added to "
+                f"campaign {campaign_id}. Reason: {reason}")
+    except GuardrailViolation as e:
+        return f"✗ Guardrail blocked this change: {e}"
+    except Exception as e:
+        logger.exception("add_negative_keyword failed")
+        return f"✗ Error: {e}"
+
+
+@mcp.tool()
+async def create_campaign(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    name: str = Field(description="Campaign name"),
+    daily_budget: float = Field(description="Daily budget in account currency (e.g. 20.0 for ₺20)"),
+    advertising_channel_type: str = Field(
+        description="Channel: SEARCH, DISPLAY, SHOPPING, VIDEO, etc.",
+        default="SEARCH"
+    ),
+    reason: str = Field(description="Why you're creating this campaign (logged for audit)"),
+    start_paused: bool = Field(
+        description="If True (default), campaign is created PAUSED so you can configure targeting before enabling. STRONGLY RECOMMENDED for autonomous creation.",
+        default=True
+    )
+) -> str:
+    """
+    Create a new campaign. ⚠️ HIGH-RISK ACTION.
+
+    This is the most dangerous write operation in the toolkit — a misconfigured
+    campaign can burn budget very fast once enabled. Guardrails:
+    - New campaign starts PAUSED by default (configure targeting, then manually enable)
+    - Daily budget cannot push account total over the cap
+    - Default to SEARCH channel (the most predictable for autonomous setup)
+
+    Even with these guardrails, this should not be used for routine optimization.
+    Use it only when there's a clear strategic reason to launch a new campaign.
+    """
+    try:
+        dry = _maybe_dry_run(
+            f"create campaign '{name}' ({advertising_channel_type}, ₺{daily_budget}/day, "
+            f"start_paused={start_paused}). Reason: {reason}"
+        )
+        if dry:
+            return dry
+
+        creds = get_credentials()
+        headers = get_headers(creds)
+        formatted = format_customer_id(customer_id)
+
+        budget_micros = int(round(daily_budget * 1_000_000))
+        # If created paused, we still pre-check budget (so it can't be enabled later
+        # via enable_campaign without re-checking the cap).
+        _enforce_total_budget_cap(customer_id, delta_micros=budget_micros, creds=creds, headers=headers)
+
+        logger.info(
+            f"[WRITE] Creating campaign '{name}' ({advertising_channel_type}), "
+            f"budget ₺{daily_budget}, start_paused={start_paused}. Reason: {reason}"
+        )
+
+        # Step 1: create the budget
+        budget_url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/campaignBudgets:mutate"
+        budget_payload = {
+            "operations": [{
+                "create": {
+                    "name": f"Budget for {name} ({datetime.utcnow().isoformat()})",
+                    "amountMicros": str(budget_micros),
+                    "deliveryMethod": "STANDARD",
+                    "explicitlyShared": False
+                }
+            }]
+        }
+        budget_resp = requests.post(budget_url, headers=headers, json=budget_payload)
+        if budget_resp.status_code != 200:
+            return f"Error creating budget: {budget_resp.text}"
+        budget_resource = budget_resp.json()["results"][0]["resourceName"]
+
+        # Step 2: create the campaign
+        campaign_url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted}/campaigns:mutate"
+        campaign_payload = {
+            "operations": [{
+                "create": {
+                    "name": name,
+                    "advertisingChannelType": advertising_channel_type.upper(),
+                    "status": "PAUSED" if start_paused else "ENABLED",
+                    "manualCpc": {"enhancedCpcEnabled": False},
+                    "campaignBudget": budget_resource,
+                    "networkSettings": {
+                        "targetGoogleSearch": True,
+                        "targetSearchNetwork": True,
+                        "targetContentNetwork": False,
+                        "targetPartnerSearchNetwork": False
+                    }
+                }
+            }]
+        }
+        campaign_resp = requests.post(campaign_url, headers=headers, json=campaign_payload)
+        if campaign_resp.status_code != 200:
+            return f"Error creating campaign (budget {budget_resource} was created): {campaign_resp.text}"
+
+        new_resource = campaign_resp.json()["results"][0]["resourceName"]
+        new_id = new_resource.split("/")[-1]
+        status_str = "PAUSED" if start_paused else "ENABLED"
+        return (
+            f"✓ Campaign '{name}' created (ID: {new_id}, status: {status_str}, "
+            f"budget: ₺{daily_budget}/day).\n"
+            f"Reason: {reason}\n\n"
+            f"{'⚠️ Campaign is PAUSED — configure ad groups, keywords, and ads before enabling.' if start_paused else '⚠️ Campaign is ENABLED and will start serving.'}"
+        )
+    except GuardrailViolation as e:
+        return f"✗ Guardrail blocked this change: {e}"
+    except Exception as e:
+        logger.exception("create_campaign failed")
+        return f"✗ Error: {e}"
+
+
+# ============================================================================
+# END WRITE TOOLS
+# ============================================================================
+
 
 if __name__ == "__main__":
     import os
