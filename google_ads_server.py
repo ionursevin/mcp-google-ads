@@ -24,11 +24,13 @@ logger = logging.getLogger('google_ads_server')
 # Writes in the "saved authorized user" format so get_oauth_credentials()
 # loads it directly without triggering the interactive browser flow.
 _creds_path_default = "/tmp/google_ads_credentials.json"
+logger.info(f"Credentials bootstrap check: CREDENTIALS_PATH={os.environ.get('GOOGLE_ADS_CREDENTIALS_PATH')!r}, CLIENT_ID set={bool(os.environ.get('GOOGLE_ADS_CLIENT_ID'))}, CLIENT_SECRET set={bool(os.environ.get('GOOGLE_ADS_CLIENT_SECRET'))}, REFRESH_TOKEN set={bool(os.environ.get('GOOGLE_ADS_REFRESH_TOKEN'))}")
 if not os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH") and os.environ.get("GOOGLE_ADS_CLIENT_ID"):
     _refresh_token = os.environ.get("GOOGLE_ADS_REFRESH_TOKEN")
     _client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
     _client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
     if _refresh_token and _client_id and _client_secret:
+        logger.info(f"Writing credentials to {_creds_path_default}")
         _creds_payload = {
             "token": None,
             "refresh_token": _refresh_token,
